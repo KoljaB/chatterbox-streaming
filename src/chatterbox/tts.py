@@ -9,6 +9,7 @@ import torch
 import perth
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+from typing import Optional, Tuple
 
 from .models.t3 import T3
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
@@ -62,6 +63,77 @@ def punc_norm(text: str) -> str:
 
     return text
 
+class SmoothAudioStreamer:
+    def __init__(self, sample_rate: int, overlap_samples: int = 320):  # ~20ms at 16kHz
+        self.sr = sample_rate
+        self.overlap_samples = overlap_samples
+        self.previous_tail: Optional[np.ndarray] = None
+        
+    def smooth_chunk_boundary(self, current_chunk: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Smooth the boundary between previous and current chunk.
+        Returns: (chunk_to_yield, tail_to_keep)
+        """
+        if self.previous_tail is None:
+            # First chunk - just keep the tail for next time
+            if len(current_chunk) > self.overlap_samples:
+                chunk_to_yield = current_chunk[:-self.overlap_samples]
+                tail_to_keep = current_chunk[-self.overlap_samples:].copy()
+                return chunk_to_yield, tail_to_keep
+            else:
+                # Chunk too small, keep entire chunk as tail
+                return np.array([]), current_chunk.copy()
+        
+        # We have a previous tail to blend with
+        overlap_size = min(self.overlap_samples, len(current_chunk), len(self.previous_tail))
+        
+        if overlap_size == 0:
+            # No overlap possible
+            chunk_to_yield = np.concatenate([self.previous_tail, current_chunk[:-self.overlap_samples]])
+            tail_to_keep = current_chunk[-self.overlap_samples:].copy()
+            return chunk_to_yield, tail_to_keep
+        
+        # Create smooth transition using cosine interpolation (smoother than linear)
+        blend_region_prev = self.previous_tail[-overlap_size:]
+        blend_region_curr = current_chunk[:overlap_size]
+        
+        # Cosine interpolation weights (smoother than linear)
+        t = np.linspace(0, np.pi, overlap_size)
+        weight_prev = (np.cos(t) + 1) / 2  # 1 -> 0
+        weight_curr = 1 - weight_prev      # 0 -> 1
+        
+        # Blend the overlapping regions
+        blended_region = blend_region_prev * weight_prev + blend_region_curr * weight_curr
+        
+        # Construct the output
+        pre_blend = self.previous_tail[:-overlap_size] if len(self.previous_tail) > overlap_size else np.array([])
+        post_blend = current_chunk[overlap_size:-self.overlap_samples] if len(current_chunk) > overlap_size + self.overlap_samples else np.array([])
+        
+        chunk_to_yield = np.concatenate([pre_blend, blended_region, post_blend])
+        
+        # Keep tail for next iteration
+        tail_to_keep = current_chunk[-self.overlap_samples:].copy() if len(current_chunk) >= self.overlap_samples else current_chunk.copy()
+        
+        return chunk_to_yield, tail_to_keep
+    
+    def process_chunk(self, audio_chunk: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Process an audio chunk and return the smoothed portion ready for playback.
+        Returns None if no audio is ready to yield yet.
+        """
+        chunk_to_yield, self.previous_tail = self.smooth_chunk_boundary(audio_chunk)
+        
+        return chunk_to_yield if len(chunk_to_yield) > 0 else None
+    
+    def finalize(self) -> Optional[np.ndarray]:
+        """
+        Call this after the last chunk to get any remaining audio.
+        """
+        if self.previous_tail is not None and len(self.previous_tail) > 0:
+            final_chunk = self.previous_tail
+            self.previous_tail = None
+            return final_chunk
+        return None
 
 @dataclass
 class Conditionals:
@@ -136,6 +208,7 @@ class ChatterboxTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+        self.audio_smoother = SmoothAudioStreamer(sample_rate=self.sr, overlap_samples=int(0.02 * self.sr))
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -411,6 +484,79 @@ class ChatterboxTTS:
             )
             past = output.past_key_values
 
+    def _process_token_buffer_smooth(
+        self,
+        token_buffer,
+        all_tokens_so_far,
+        context_window,
+        start_time,
+        metrics,
+        print_metrics,
+        audio_smoother: SmoothAudioStreamer
+    ):
+        """Modified version that uses smooth audio blending instead of fade-in"""
+        
+        # Combine buffered chunks of tokens
+        new_tokens = torch.cat(token_buffer, dim=-1)
+
+        # Build tokens_to_process by including a context window
+        if len(all_tokens_so_far) > 0:
+            context_tokens = (
+                all_tokens_so_far[-context_window:]
+                if len(all_tokens_so_far) > context_window
+                else all_tokens_so_far
+            )
+            tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1)
+            context_length = len(context_tokens)
+        else:
+            tokens_to_process = new_tokens
+            context_length = 0
+
+        # Drop any invalid tokens and move to the correct device
+        clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        if len(clean_tokens) == 0:
+            return None, 0.0, False
+
+        # Run S3Gen inference to get a waveform (1 × T)
+        wav, _ = self.s3gen.inference(
+            speech_tokens=clean_tokens,
+            ref_dict=self.conds.gen,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+
+        # If we have context tokens, crop out the samples corresponding to them
+        if context_length > 0:
+            samples_per_token = len(wav) / len(clean_tokens)
+            skip_samples = int(context_length * samples_per_token)
+            audio_chunk = wav[skip_samples:]
+        else:
+            audio_chunk = wav
+
+        if len(audio_chunk) == 0:
+            return None, 0.0, False
+
+        # Apply smooth blending instead of fade-in
+        smoothed_chunk = audio_smoother.process_chunk(audio_chunk)
+        
+        if smoothed_chunk is None or len(smoothed_chunk) == 0:
+            return None, 0.0, False
+
+        # Apply watermarking and convert to tensor
+        watermarked_chunk = self.watermarker.apply_watermark(smoothed_chunk, sample_rate=self.sr)
+        audio_tensor = torch.from_numpy(watermarked_chunk).unsqueeze(0)
+        
+        # Compute audio duration
+        audio_duration = len(smoothed_chunk) / self.sr
+
+        # Update first‐chunk latency metric
+        if metrics.chunk_count == 0:
+            metrics.latency_to_first_chunk = time.time() - start_time
+            if print_metrics:
+                print(f"Latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
+
+        metrics.chunk_count += 1
+        return audio_tensor, audio_duration, True
+
     def _process_token_buffer(
         self,
         token_buffer,
@@ -482,8 +628,6 @@ class ChatterboxTTS:
         metrics.chunk_count += 1
         return audio_tensor, audio_duration, True
 
-
-
     def generate_stream(
         self,
         text: str,
@@ -493,11 +637,12 @@ class ChatterboxTTS:
         temperature: float = 0.8,
         chunk_size: int = 25,  # Tokens per chunk
         context_window = 50,
-        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        overlap_duration=0.02,  # seconds for overlap blending (replaces fade_duration)
         print_metrics: bool = True,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming version of generate that yields audio chunks as they are generated.
+        Uses smooth cosine-based blending instead of fade-in to eliminate pops/clicks.
         
         Args:
             text: Input text to synthesize
@@ -507,7 +652,7 @@ class ChatterboxTTS:
             temperature: Sampling temperature
             chunk_size: Number of speech tokens per chunk
             context_window: The context passed for each chunk
-            fade_duration: Seconds to apply linear fade-in on each chunk
+            overlap_duration: Seconds for overlap blending between chunks
             print_metrics: Whether to print RTF and latency metrics
             
         Yields:
@@ -544,6 +689,10 @@ class ChatterboxTTS:
         total_audio_length = 0.0
         all_tokens_processed = []  # Keep track of all tokens processed so far
         
+        # Initialize the audio smoother
+        overlap_samples = int(overlap_duration * self.sr)
+        audio_smoother = SmoothAudioStreamer(sample_rate=self.sr, overlap_samples=overlap_samples)
+        
         with torch.inference_mode():
             # Stream speech tokens
             for token_chunk in self.inference_stream(
@@ -557,10 +706,10 @@ class ChatterboxTTS:
                 # Extract only the conditional batch
                 token_chunk = token_chunk[0]
                 
-                # Process each chunk immediately
-                audio_tensor, audio_duration, success = self._process_token_buffer(
+                # Process each chunk with smooth blending
+                audio_tensor, audio_duration, success = self._process_token_buffer_smooth(
                     [token_chunk], all_tokens_processed, context_window, 
-                    start_time, metrics, print_metrics, fade_duration
+                    start_time, metrics, print_metrics, audio_smoother
                 )
                 
                 if success:
@@ -573,6 +722,16 @@ class ChatterboxTTS:
                 else:
                     all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
 
+            # Finalize and yield any remaining audio from the smoother
+            final_chunk = audio_smoother.finalize()
+            if final_chunk is not None and len(final_chunk) > 0:
+                watermarked_final = self.watermarker.apply_watermark(final_chunk, sample_rate=self.sr)
+                final_tensor = torch.from_numpy(watermarked_final).unsqueeze(0)
+                final_duration = len(final_chunk) / self.sr
+                total_audio_length += final_duration
+                metrics.chunk_count += 1
+                yield final_tensor, metrics
+
         # Final metrics calculation
         metrics.total_generation_time = time.time() - start_time
         metrics.total_audio_duration = total_audio_length
@@ -583,3 +742,103 @@ class ChatterboxTTS:
                 print(f"Total audio duration: {metrics.total_audio_duration:.3f}s")
                 print(f"RTF (Real-Time Factor): {metrics.rtf:.3f}")
                 print(f"Total chunks yielded: {metrics.chunk_count}")
+
+    # def generate_stream(
+    #     self,
+    #     text: str,
+    #     audio_prompt_path: Optional[str] = None,
+    #     exaggeration: float = 0.5,
+    #     cfg_weight: float = 0.5,
+    #     temperature: float = 0.8,
+    #     chunk_size: int = 25,  # Tokens per chunk
+    #     context_window = 50,
+    #     fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+    #     print_metrics: bool = True,
+    # ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+    #     """
+    #     Streaming version of generate that yields audio chunks as they are generated.
+        
+    #     Args:
+    #         text: Input text to synthesize
+    #         audio_prompt_path: Optional path to reference audio for voice cloning
+    #         exaggeration: Emotion exaggeration factor
+    #         cfg_weight: Classifier-free guidance weight
+    #         temperature: Sampling temperature
+    #         chunk_size: Number of speech tokens per chunk
+    #         context_window: The context passed for each chunk
+    #         fade_duration: Seconds to apply linear fade-in on each chunk
+    #         print_metrics: Whether to print RTF and latency metrics
+            
+    #     Yields:
+    #         Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
+    #         and metrics contains timing information
+    #     """
+    #     start_time = time.time()
+    #     metrics = StreamingMetrics()
+        
+    #     if audio_prompt_path:
+    #         self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+    #     else:
+    #         assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+    #     # Update exaggeration if needed
+    #     if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+    #         _cond: T3Cond = self.conds.t3
+    #         self.conds.t3 = T3Cond(
+    #             speaker_emb=_cond.speaker_emb,
+    #             cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+    #             emotion_adv=exaggeration * torch.ones(1, 1, 1),
+    #         ).to(device=self.device)
+
+    #     # Norm and tokenize text
+    #     text = punc_norm(text)
+    #     text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+    #     text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
+    #     sot = self.t3.hp.start_text_token
+    #     eot = self.t3.hp.stop_text_token
+    #     text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+    #     text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+    #     total_audio_length = 0.0
+    #     all_tokens_processed = []  # Keep track of all tokens processed so far
+        
+    #     with torch.inference_mode():
+    #         # Stream speech tokens
+    #         for token_chunk in self.inference_stream(
+    #             t3_cond=self.conds.t3,
+    #             text_tokens=text_tokens,
+    #             max_new_tokens=1000,
+    #             temperature=temperature,
+    #             cfg_weight=cfg_weight,
+    #             chunk_size=chunk_size,
+    #         ):
+    #             # Extract only the conditional batch
+    #             token_chunk = token_chunk[0]
+                
+    #             # Process each chunk immediately
+    #             audio_tensor, audio_duration, success = self._process_token_buffer(
+    #                 [token_chunk], all_tokens_processed, context_window, 
+    #                 start_time, metrics, print_metrics, fade_duration
+    #             )
+                
+    #             if success:
+    #                 total_audio_length += audio_duration
+    #                 yield audio_tensor, metrics
+                
+    #             # Update all_tokens_processed with the new tokens
+    #             if len(all_tokens_processed) == 0:
+    #                 all_tokens_processed = token_chunk
+    #             else:
+    #                 all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+
+    #     # Final metrics calculation
+    #     metrics.total_generation_time = time.time() - start_time
+    #     metrics.total_audio_duration = total_audio_length
+    #     if total_audio_length > 0:
+    #         metrics.rtf = metrics.total_generation_time / total_audio_length
+    #         if print_metrics:
+    #             print(f"Total generation time: {metrics.total_generation_time:.3f}s")
+    #             print(f"Total audio duration: {metrics.total_audio_duration:.3f}s")
+    #             print(f"RTF (Real-Time Factor): {metrics.rtf:.3f}")
+    #             print(f"Total chunks yielded: {metrics.chunk_count}")
